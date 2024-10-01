@@ -13,27 +13,23 @@ import java.util.concurrent.*;
 
 public class Server {
     private final List<String> validPaths = List.of("/index.html", "/spring.svg", "/spring.png", "/resources.html", "/styles.css", "/app.js", "/links.html", "/forms.html", "/classic.html", "/events.html", "/events.js");
-    private final ExecutorService service = Executors.newFixedThreadPool(60);
-
+    private final ExecutorService service = Executors.newFixedThreadPool(64);
 
     /**
      * Запускает сервер
      */
-    public void start() {
-        try (final var serverSocket = new ServerSocket(9999)) {
+    public void start(int port) {
+        try (final var serverSocket = new ServerSocket(port)) {
             while (true) {
-                try (
-                        final var socket = serverSocket.accept();
-                        final var in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                        final var out = new BufferedOutputStream(socket.getOutputStream());
-                ) {
-                    // read only request line for simplicity
-                    // must be in form GET /path HTTP/1.1
-
-                    Callable<String> task = () -> in.readLine();
-                    Future<String> result = service.submit(task);
-                    method(out, result);
-                }
+                final var socket = serverSocket.accept();
+                service.execute(() -> {
+                    try (final var in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                         final var out = new BufferedOutputStream(socket.getOutputStream())) {
+                        handler(out, in);
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                });
             }
         } catch (IOException e) {
             e.printStackTrace();
@@ -42,82 +38,42 @@ public class Server {
         }
     }
 
-
     /**
-     * Обрабатывает конкретное подлкючение
+     * Обрабатывает подлкючение
      *
-     * @param out
+     * @param out - выходной поток
+     * @param in  - входной поток
      */
-    void method(BufferedOutputStream out, Future<String> result) {
-        final String parts1;
+    private void handler(BufferedOutputStream out, BufferedReader in) {
         try {
-            parts1 = result.get();
-        } catch (InterruptedException | ExecutionException e) {
-            throw new RuntimeException(e);
-        }
+            String parts1 = in.readLine();
+            final var parts = parts1.split(" ");
 
-        final var parts = parts1.split(" ");
-
-        if (parts.length != 3) {
-            // just close socket
-            return;
-        }
-        final var path = parts[1];
-        if (!validPaths.contains(path)) {
-            try {
-                out.write((
-                        "HTTP/1.1 404 Not Found\r\n" +
-                                "Content-Length: 0\r\n" +
-                                "Connection: close\r\n" +
-                                "\r\n"
-                ).getBytes());
-            } catch (IOException e) {
-                throw new RuntimeException(e);
+            if (parts.length != 3) {
+                return;
             }
-            try {
-                out.flush();
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-            return;
-        }
-        final var filePath = Path.of(".", "public", path);
-        final String mimeType;
-        try {
-            mimeType = Files.probeContentType(filePath);
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
 
-        // special case for classic
-        if (path.equals("/classic.html")) {
-            final String template;
-            try {
+            final var path = parts[1];
+            if (!validPaths.contains(path)) {
+                badRequest(out);
+                return;
+            }
+            final var filePath = Path.of(".", "public", path);
+
+            final String mimeType = Files.probeContentType(filePath);
+            if (path.equals("/classic.html")) {
+                final String template;
                 template = Files.readString(filePath);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-            final var content = template.replace(
-                    "{time}",
-                    LocalDateTime.now().toString()
-            ).getBytes();
-            try {
-                sendResponse(out, "HTTP/1.1 200 OK", content.length, mimeType);
+                final var content = template.replace("{time}", LocalDateTime.now().toString()).getBytes();
+                sendResponse(out, content.length, mimeType);
                 out.write(content);
-
                 out.flush();
-            } catch (IOException e) {
-                throw new RuntimeException(e);
+                return;
             }
-            return;
-        }
-        try {
+
             final var length = Files.size(filePath);
-
-            sendResponse(out, "HTTP/1.1 200 OK", length, mimeType);
-
+            sendResponse(out, length, mimeType);
             Files.copy(filePath, out);
-
             out.flush();
         } catch (IOException e) {
             throw new RuntimeException(e);
@@ -126,19 +82,38 @@ public class Server {
 
 
     /**
-     * Формирует и отправляет ответ клиенту
+     * Формирует и отправляет ответ клиенту, при котором запрос со стороны
+     * клиента является корректным и выполнен без проблем со стороны сервера
      *
      * @param out      - выходной поток
-     * @param status   - статус ответа
      * @param length   - длина ответа
      * @param mimeType - метатег
-     * @throws IOException
      */
-    private static void sendResponse(BufferedOutputStream out, String status, long length, String mimeType) throws IOException {
-        out.write((status + "\r\n" +
-                "Content-Type: " + mimeType + "\r\n" +
-                "Content-Length: " + length + "\r\n" +
-                "Connection: close\r\n" +
-                "\r\n").getBytes());
+    private static void sendResponse(BufferedOutputStream out, long length, String mimeType) {
+        String status = "HTTP/1.1 200 OK";
+        try {
+            out.write((status + "\r\n" + "Content-Type: " + mimeType + "\r\n" + "Content-Length: " + length + "\r\n" + "Connection: close\r\n" + "\r\n").getBytes());
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
     }
+
+    /**
+     * Формирует и отправляет ответ при неверном запросе
+     *
+     * @param out - входной поток
+     */
+    private static void badRequest(BufferedOutputStream out) {
+        try {
+            out.write(("HTTP/1.1 404 Not Found\r\n" +
+                    "Content-Length: 0\r\n" +
+                    "Connection: close\r\n" + "\r\n")
+                    .getBytes());
+            out.flush();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+
 }
